@@ -1,0 +1,18 @@
+# Runtime state / secrets
+/data.db
+/data.db-*
+/data.db.bak*
+*.db
+*.db-*
+*.log
+*.pid
+*.pyc
+__pycache__/
+app.py.bak*
+*.bak*
+.env
+.env.*
+!.env.example
+
+# Local helper logs
+*.log.*
