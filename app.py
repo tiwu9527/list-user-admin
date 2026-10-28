@@ -9,12 +9,10 @@ DB = os.path.join(BASE, 'data.db')
 HOST = os.environ.get('OPENLIST_ADMIN_HOST', '0.0.0.0')
 PORT = int(os.environ.get('OPENLIST_ADMIN_PORT', '19100'))
 INVITE_HOST = os.environ.get('OPENLIST_INVITE_HOST', 'in.tiwunb.xyz').lower()
-LOCAL_ADMIN_TOKEN = os.environ.get('OPENLIST_ADMIN_TOKEN', 'change-me')
+LOCAL_ADMIN_TOKEN = os.environ.get('OPENLIST_ADMIN_TOKEN') or secrets.token_urlsafe(32)
 SESSIONS = set()
 DB_LOCK = threading.RLock()
 REGISTER_LOCK = threading.Lock()
-LOCAL_DEFAULT_USER = os.environ.get('OPENLIST_LOCAL_USER', 'admin')
-LOCAL_DEFAULT_PASS = os.environ.get('OPENLIST_LOCAL_PASS', 'admin123456')
 
 
 def db():
@@ -123,8 +121,16 @@ def local_hash(value, salt='openlist-user-admin'):
     return hashlib.sha256((salt + value).encode()).hexdigest()
 
 def ensure_local_admin():
-    if not setting('local_user'): save_setting('local_user', LOCAL_DEFAULT_USER)
-    if not setting('local_pass_hash'): save_setting('local_pass_hash', local_hash(LOCAL_DEFAULT_PASS))
+    # Never silently provision a known default password. A fresh database must
+    # complete the explicit first-run setup flow before admin access is granted.
+    return bool(setting('local_user') and setting('local_pass_hash'))
+
+def setup_required():
+    return not ensure_local_admin()
+
+def setup_page(error=''):
+    error_html = '<div class="login-error">'+html.escape(error)+'</div>' if error else ''
+    return '''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>首次设置</title><style>body{margin:0;background:linear-gradient(135deg,#0b1020,#111b35);color:#eef3ff;font:15px system-ui,-apple-system,"Microsoft YaHei",sans-serif}.wrap{max-width:440px;margin:12vh auto;padding:24px;background:#121a2d;border:1px solid #273452;border-radius:18px}label{display:block;color:#cbd7ff;margin:14px 0 5px}input{width:100%;box-sizing:border-box;border:1px solid #273452;background:#0c1427;color:#eef3ff;border-radius:8px;padding:11px;font:inherit}button{width:100%;border:0;border-radius:8px;background:#6d8cff;color:#fff;padding:12px;font-weight:700;cursor:pointer;margin-top:22px}.hint{color:#9eacc8;line-height:1.6}.login-error{margin:14px 0;padding:11px;border:1px solid #c45165;border-radius:9px;background:#3b202c;color:#ffc4cc}</style></head><body><main class="wrap"><h2>首次设置管理后台</h2><p class="hint">请设置新的后台账号和密码。密码至少 12 位；此步骤完成前后台管理功能不可用。</p>'''+error_html+'''<form method="post" action="/setup"><label>后台账号</label><input name="username" required minlength="4" maxlength="64" autocomplete="username"><label>新密码（至少 12 位）</label><input type="password" name="password" required minlength="12" autocomplete="new-password"><label>确认新密码</label><input type="password" name="confirm_password" required minlength="12" autocomplete="new-password"><button>保存并进入管理后台</button></form></main></body></html>'''
 
 def check_local_login(username, passwd):
     ensure_local_admin()
@@ -283,6 +289,11 @@ class Handler(BaseHTTPRequestHandler):
         return self.send(303, '', headers={'Location':location})
     def do_GET(self):
         p=urlparse(self.path); q=parse_qs(p.query)
+        if p.path == '/health': return self.send(200,'ok','text/plain')
+        if p.path == '/setup':
+            return self.send(200, setup_page()) if setup_required() else self.send(303, '', headers={'Location':'/login'})
+        if setup_required() and p.path not in ('/setup', '/health'):
+            return self.send(200, setup_page())
         host=self.headers.get('Host','').split(':',1)[0].lower()
         if host == INVITE_HOST and p.path == '/login': return self.send(403,'forbidden','text/plain')
         if p.path == '/api/check-username' and host == INVITE_HOST:
@@ -292,9 +303,7 @@ class Handler(BaseHTTPRequestHandler):
             invalid=invalid_username(username)
             return self.send(200,json.dumps({'exists':exists,'forbidden':forbidden,'invalid':invalid},ensure_ascii=False),'application/json; charset=utf-8')
         if p.path == '/login':
-            ensure_local_admin()
             return self.send(200, login_modal())
-        if p.path == '/health': return self.send(200,'ok','text/plain')
         if host == INVITE_HOST and p.path not in ('/query',) and not p.path.startswith('/register/'):
             return self.send(403,'forbidden','text/plain')
         if p.path == '/query':
@@ -471,6 +480,16 @@ class Handler(BaseHTTPRequestHandler):
         # Public invite redemption is serialized by REGISTER_LOCK, not DB_LOCK,
         # so slow OpenList calls cannot stall the admin UI.
         try:
+            if p.path == '/setup':
+                if not setup_required(): return self.send(409, 'Setup already completed', 'text/plain')
+                username=d.get('username','').strip(); passwd=d.get('password',''); confirm=d.get('confirm_password','')
+                if len(username)<4 or len(username)>64: return self.send(400, setup_page('账号长度需为 4-64 位'))
+                if len(passwd)<12: return self.send(400, setup_page('密码至少需要 12 位'))
+                if passwd != confirm: return self.send(400, setup_page('两次输入的密码不一致'))
+                save_setting('local_user', username)
+                save_setting('local_pass_hash', local_hash(passwd))
+                sid=secrets.token_urlsafe(32); SESSIONS.add(sid)
+                return self.send(303,'',headers={'Location':'/','Set-Cookie':'openlist_session='+sid+'; Path=/; HttpOnly; SameSite=Lax'})
             if p.path == '/login':
                 if not check_local_login(d.get('username',''), d.get('password','')):
                     return self.send(401, login_modal('请输入正确的账号和密码'))
