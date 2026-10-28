@@ -469,10 +469,10 @@ class Handler(BaseHTTPRequestHandler):
             page_size=20
             filters=[]; user_params=[]
             if keyword:
-                filters.append('username LIKE ?'); user_params.append('%'+keyword+'%')
+                filters.append('users.username LIKE ?'); user_params.append('%'+keyword+'%')
             if plan_filter!='total':
-                if plan_filter=='expired': filters.append("expires_at IS NOT NULL AND expires_at<=?")
-                else: filters.append('plan=?')
+                if plan_filter=='expired': filters.append("users.expires_at IS NOT NULL AND users.expires_at<=?")
+                else: filters.append('users.plan=?')
                 user_params.append(now() if plan_filter=='expired' else plan_filter)
             user_where=' AND '.join(filters) if filters else '1=1'
             user_params=tuple(user_params)
