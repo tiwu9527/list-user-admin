@@ -50,6 +50,14 @@
 - 设置页面隐藏 OpenList 管理员密码，使用 `***` 展示；
 - 页面支持移动端适配和 Cloudflare HTTPS 访问。
 
+## 多服务器与凭据加密
+
+- 后台可维护多台服务器、设置推荐服务器；邀请链接不绑定服务器，注册页允许选择服务器。未选择时预选推荐服务器。
+- 全局用户名由本地 `users.username UNIQUE` 约束；用户注册不通过 OpenList 用户列表检测用户名。
+- 旧服务器配置首次启动时导入为“波尔1服”，原有本地用户绑定该服务器；首次续费时验证原密码并保存加密凭据。
+- 新用户的密码以及首次续费验证成功的旧用户密码使用 Fernet 加密后保存在 SQLite。启动前必须配置持久化 `OPENLIST_PASSWORD_KEY`（Fernet 格式），并将密钥保存在数据库目录之外、妥善备份；密钥丢失后已有凭据无法解密。生成密钥示例：`python3 -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())'`。还需安装 Python 包 `cryptography`。
+- 注意：OpenList 管理员连接密码仍是现有服务器配置存储方式；本次加密专指用户凭据。
+
 ## 重要接口约定
 
 OpenList 用户管理 API：

@@ -11,5 +11,11 @@ if [ -r "$PIDFILE" ]; then
   fi
 fi
 cd "$BASE"
+# Load private runtime configuration (e.g. OPENLIST_PASSWORD_KEY) without committing it.
+if [ -f "$BASE/.env" ]; then
+  set -a
+  . "$BASE/.env"
+  set +a
+fi
 nohup python3 -u "$BASE/app.py" >>"$LOG" 2>&1 &
 echo $! >"$PIDFILE"

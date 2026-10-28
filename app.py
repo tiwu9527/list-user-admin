@@ -15,19 +15,40 @@ DB_LOCK = threading.RLock()
 REGISTER_LOCK = threading.Lock()
 
 
+def password_cipher():
+    # Deployment must provide a persistent secret outside SQLite; never silently generate a key.
+    raw=os.environ.get('OPENLIST_PASSWORD_KEY','').strip()
+    if not raw: raise RuntimeError('未配置 OPENLIST_PASSWORD_KEY，无法安全保存用户密码')
+    try:
+        from cryptography.fernet import Fernet
+        return Fernet(raw.encode())
+    except ImportError: raise RuntimeError('缺少 cryptography 依赖')
+    except Exception: raise RuntimeError('OPENLIST_PASSWORD_KEY 格式无效')
+
+def encrypt_user_password(value): return password_cipher().encrypt(value.encode()).decode()
+def decrypt_user_password(value): return password_cipher().decrypt(value.encode()).decode()
+
 def db():
     # SQLite 只能单写入；所有后台写请求由 do_POST 串行化，健康检查不受业务请求阻塞。
     c = sqlite3.connect(DB, timeout=10, check_same_thread=False)
     c.row_factory = sqlite3.Row
-    c.execute('PRAGMA busy_timeout=10000')
-    c.execute('PRAGMA journal_mode=WAL')
+    c.execute('PRAGMA busy_timeout=30000')
+    # WAL mode is persistent; avoid issuing journal_mode changes on every connection.
     c.execute('PRAGMA synchronous=NORMAL')
     with DB_LOCK:
         c.execute('''CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)''')
     c.execute('''CREATE TABLE IF NOT EXISTS users (
         id INTEGER PRIMARY KEY AUTOINCREMENT, openlist_id INTEGER, username TEXT UNIQUE NOT NULL,
         base_path TEXT NOT NULL, disabled INTEGER NOT NULL DEFAULT 0,
-        plan TEXT NOT NULL DEFAULT 'custom', expires_at TEXT, created TEXT NOT NULL, updated TEXT NOT NULL)''')
+        plan TEXT NOT NULL DEFAULT 'custom', expires_at TEXT, created TEXT NOT NULL, updated TEXT NOT NULL, server_id INTEGER, password_enc TEXT)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS servers (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, url TEXT NOT NULL,
+        username TEXT NOT NULL, password TEXT NOT NULL, quota INTEGER NOT NULL DEFAULT 0,
+        public_url TEXT NOT NULL DEFAULT '', token TEXT NOT NULL DEFAULT '', enabled INTEGER NOT NULL DEFAULT 1)''')
+    user_cols={r['name'] for r in c.execute('PRAGMA table_info(users)').fetchall()}
+    if 'server_id' not in user_cols: c.execute('ALTER TABLE users ADD COLUMN server_id INTEGER')
+    if 'password_enc' not in user_cols: c.execute('ALTER TABLE users ADD COLUMN password_enc TEXT')
+    # Legacy users remain bound to legacy OpenList settings (virtual server id 0).
     cols = {r['name'] for r in c.execute('PRAGMA table_info(users)').fetchall()}
     if 'plan' not in cols: c.execute("ALTER TABLE users ADD COLUMN plan TEXT NOT NULL DEFAULT 'custom'")
     if 'expires_at' not in cols: c.execute('ALTER TABLE users ADD COLUMN expires_at TEXT')
@@ -38,11 +59,30 @@ def db():
         max_uses INTEGER NOT NULL DEFAULT 1, expires_at TEXT,
         created TEXT NOT NULL, used_at TEXT, registered_username TEXT)''')
     cols = {r['name'] for r in c.execute('PRAGMA table_info(invites)').fetchall()}
+    if 'server_id' not in cols: c.execute('ALTER TABLE invites ADD COLUMN server_id INTEGER')
     if 'used_at' not in cols: c.execute("ALTER TABLE invites ADD COLUMN used_at TEXT")
     if 'registered_username' not in cols: c.execute("ALTER TABLE invites ADD COLUMN registered_username TEXT")
     if 'archived' not in cols: c.execute("ALTER TABLE invites ADD COLUMN archived INTEGER NOT NULL DEFAULT 0")
     if 'exported' not in cols: c.execute("ALTER TABLE invites ADD COLUMN exported INTEGER NOT NULL DEFAULT 0")
     if 'exported_at' not in cols: c.execute("ALTER TABLE invites ADD COLUMN exported_at TEXT")
+    # Import the existing single-server configuration as the explicitly named legacy server.
+    # Existing local users are bound to this server; invitation records stay server-neutral.
+    legacy={r['key']:r['value'] for r in c.execute("SELECT key,value FROM settings WHERE key IN ('openlist_url','openlist_user','openlist_pass','openlist_token','default_path')").fetchall()}
+    if legacy.get('openlist_url') and not c.execute("SELECT 1 FROM servers WHERE name='波尔1服' LIMIT 1").fetchone():
+        # Start new server IDs at 1; keep ID 0 reserved as invalid/sentinel.
+        legacy_id=c.execute('SELECT COALESCE(MAX(id),0)+1 FROM servers').fetchone()[0]
+        c.execute('INSERT INTO servers(id,name,url,username,password,quota,public_url,token) VALUES(?,?,?,?,?,0,?,?)',(legacy_id,'波尔1服',legacy['openlist_url'].rstrip('/'),legacy.get('openlist_user',''),legacy.get('openlist_pass',''),legacy['openlist_url'].rstrip('/'),legacy.get('openlist_token','')))
+        c.execute('UPDATE users SET server_id=? WHERE server_id IS NULL OR server_id=0',(legacy_id,))
+        c.execute("INSERT INTO settings(key,value) VALUES('default_server_id',?) ON CONFLICT(key) DO NOTHING",(str(legacy_id),))
+    elif legacy.get('openlist_url'):
+        # Existing installations may already have legacy server ID 0; migrate it
+        # transactionally to a positive ID and update every user binding.
+        legacy_row=c.execute("SELECT id FROM servers WHERE name='波尔1服' LIMIT 1").fetchone()
+        if legacy_row and legacy_row[0]==0:
+            legacy_id=c.execute('SELECT COALESCE(MAX(id),0)+1 FROM servers').fetchone()[0]
+            c.execute('UPDATE servers SET id=? WHERE id=0',(legacy_id,))
+            c.execute('UPDATE users SET server_id=? WHERE server_id=0 OR server_id IS NULL',(legacy_id,))
+            c.execute("UPDATE settings SET value=? WHERE key='default_server_id' AND value='0'",(str(legacy_id),))
     # 已使用链接保留在历史归档中，避免删除后无法追溯来源和对账。
     c.commit()
     return c
@@ -79,13 +119,13 @@ def expire_users_once():
     with DB_LOCK:
         c=db()
         try:
-            rows=c.execute("SELECT id,username,openlist_id FROM users WHERE expires_at IS NOT NULL AND expires_at <= ? AND openlist_id IS NOT NULL ORDER BY expires_at LIMIT 100", (now(),)).fetchall()
+            rows=c.execute("SELECT id,username,openlist_id,server_id FROM users WHERE expires_at IS NOT NULL AND expires_at <= ? AND openlist_id IS NOT NULL ORDER BY expires_at LIMIT 100", (now(),)).fetchall()
             pending=[dict(r) for r in rows]
         finally:
             c.close()
     for r in pending:
         try:
-            api('POST',f"/api/admin/user/delete?id={r['openlist_id']}")
+            api('POST',f"/api/admin/user/delete?id={r['openlist_id']}",server_id=r.get('server_id'))
         except Exception:
             continue
         # Only update local mapping after remote deletion succeeds.
@@ -102,6 +142,59 @@ def expiry_worker():
         try: expire_users_once()
         except Exception: pass
         time.sleep(300)
+def get_server(server_id=None):
+    c=db()
+    try:
+        if server_id is not None: row=c.execute('SELECT * FROM servers WHERE id=? AND enabled=1',(int(server_id),)).fetchone()
+        else:
+            default_id=setting('default_server_id','')
+            row=c.execute('SELECT * FROM servers WHERE id=? AND enabled=1',(int(default_id),)).fetchone() if str(default_id).isdigit() else None
+            if not row: row=c.execute('SELECT * FROM servers WHERE enabled=1 ORDER BY id LIMIT 1').fetchone()
+        if row: return dict(row)
+        # Backward-compatible virtual server only for legacy/unassigned records.
+        if server_id not in (None,0): return None
+        if server_id is None and c.execute('SELECT 1 FROM servers WHERE enabled=1 LIMIT 1').fetchone(): return None
+        url=setting('openlist_url')
+        if url: return {'id':0,'name':'默认服务器','url':url,'username':setting('openlist_user'),'password':setting('openlist_pass'),'quota':0,'public_url':url,'token':setting('openlist_token'),'enabled':1}
+        return None
+    finally: c.close()
+
+def list_servers():
+    c=db()
+    try: return [dict(r) for r in c.execute('SELECT * FROM servers WHERE enabled=1 ORDER BY id').fetchall()]
+    finally: c.close()
+
+def server_count(server):
+    if not server: return 0
+    result=api('GET','/api/admin/user/list?page=1&per_page=1',server_id=server['id'])
+    data=result.get('data') or {}
+    total=(data.get('total') if isinstance(data,dict) else None)
+    if total is None and isinstance(result,dict): total=result.get('total')
+    if total is not None: return int(total)
+    # Fallback pagination if API omits total: count all returned account pages.
+    page=1; count=0
+    while True:
+        res=api('GET',f'/api/admin/user/list?page={page}&per_page=100',server_id=server['id'])
+        d=res.get('data') or {}; rows=d.get('content',[]) if isinstance(d,dict) else []
+        count+=len(rows)
+        if not rows or len(rows)<100: return count
+        page+=1
+
+def available_servers():
+    """Return every enabled server; failed live-count lookups must not hide options."""
+    out=[]
+    for server in list_servers():
+        try:
+            count=server_count(server)
+            server['count']=count
+            server['count_status']='ok'
+        except Exception:
+            server['count']=None
+            server['count_status']='unavailable'
+        server['selectable']=server['count_status']=='ok' and (not server['quota'] or server['count'] < server['quota'])
+        out.append(server)
+    return out
+
 def setting(key, default=''):
     c = db()
     try:
@@ -140,8 +233,19 @@ def password():
     alphabet = string.ascii_letters + string.digits + '!@#$%_-'
     return ''.join(secrets.choice(alphabet) for _ in range(16))
 
-def openlist_login(username, password):
-    base = setting('openlist_url').rstrip('/')
+def save_server_token(server_id, token):
+    c=db()
+    try: c.execute('UPDATE servers SET token=? WHERE id=?',(token,server_id)); c.commit()
+    finally: c.close()
+def clear_server_token(server_id):
+    if server_id:
+        save_server_token(server_id,'')
+    else: save_setting('openlist_token','')
+
+def openlist_login(username, password, server_id=None):
+    server=get_server(server_id)
+    if not server: raise RuntimeError('请先配置 OpenList 服务器')
+    base=server['url'].rstrip('/')
     if not base: raise RuntimeError('请先设置 OpenList 地址')
     data = json.dumps({'username': username, 'password': password}).encode()
     req = urllib.request.Request(base + '/api/auth/login', data=data, method='POST', headers={'Content-Type':'application/json'})
@@ -150,18 +254,19 @@ def openlist_login(username, password):
             result = json.loads(r.read().decode('utf-8', 'replace'))
         token = result.get('data', {}).get('token') or result.get('token')
         if not token: raise RuntimeError('OpenList 登录返回中没有 Token')
-        save_setting('openlist_token', token)
+        if server.get('id'): save_server_token(server['id'],token)
+        else: save_setting('openlist_token',token)
         return token
     except urllib.error.HTTPError as e:
         raise RuntimeError(f'管理员账号或密码错误（HTTP {e.code}）')
 
-def find_openlist_user(username):
+def find_openlist_user(username, server_id=None):
     # Avoid one huge slow response; page through users and only report absent
     # after every page has been successfully fetched.
     page_no = 1
     per_page = 100
     while True:
-        result = api('GET', f'/api/admin/user/list?page={page_no}&per_page={per_page}')
+        result = api('GET', f'/api/admin/user/list?page={page_no}&per_page={per_page}', server_id=server_id)
         data = result.get('data') or {}
         rows = data.get('content', []) if isinstance(data, dict) else []
         for user in rows:
@@ -187,16 +292,18 @@ def result_user_id(result):
         return None
     return walk(result)
 
-def api(method, path, payload=None):
-    base = setting('openlist_url').rstrip('/')
-    if not base: raise RuntimeError('请先在“设置”中配置 OpenList 地址')
+def api(method, path, payload=None, server_id=None):
+    server=get_server(server_id)
+    if not server: raise RuntimeError('请先在“设置”中配置 OpenList 服务器')
+    base=server['url'].rstrip('/')
     data = None if payload is None else json.dumps(payload).encode()
     for attempt in range(2):
-        token = setting('openlist_token')
+        server=get_server(server_id)
+        token=(server.get('token') if server and server.get('id') else setting('openlist_token'))
         if not token:
-            ouser, opass = setting('openlist_user'), setting('openlist_pass')
+            ouser, opass = server['username'], server['password']
             if not ouser or not opass: raise RuntimeError('请先在后台设置 OpenList 管理员账号和密码')
-            token = openlist_login(ouser, opass)
+            token = openlist_login(ouser, opass, server_id)
         req = urllib.request.Request(base + path, data=data, method=method, headers={'Authorization': token, 'Content-Type': 'application/json', 'Accept': 'application/json'})
         try:
             with urllib.request.urlopen(req, timeout=15) as r:
@@ -208,14 +315,14 @@ def api(method, path, payload=None):
             if code not in (None, 0, 200):
                 message = result.get('message') or result.get('msg') or f'业务错误码 {code}'
                 if (code == 401 or 'token' in str(message).lower() or 'expired' in str(message).lower()) and attempt == 0:
-                    save_setting('openlist_token', '')
+                    clear_server_token(server_id)
                     continue
                 raise RuntimeError(f'OpenList API 错误（{code}）：{message}')
             return result
         except urllib.error.HTTPError as e:
             body = e.read().decode('utf-8', 'replace')
             if e.code in (401, 403) and attempt == 0:
-                save_setting('openlist_token', '')
+                clear_server_token(server_id)
                 continue
             raise RuntimeError(f'OpenList 返回 HTTP {e.code}: {body[:300]}')
         except urllib.error.URLError as e: raise RuntimeError(f'无法连接 OpenList：{e.reason}')
@@ -237,10 +344,15 @@ def login_modal(error=''):
     login_html = '''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>后台登录</title><style>body{margin:0;background:linear-gradient(135deg,#0b1020,#111b35);color:#eef3ff;font:15px system-ui,-apple-system,"Microsoft YaHei",sans-serif}.modal-mask{position:fixed;inset:0;background:#050914cc;display:flex;align-items:center;justify-content:center;padding:20px}.modal-card{width:min(400px,100%);background:#121a2d;border:1px solid #273452;border-radius:18px;padding:28px;box-shadow:0 24px 80px #0008}.modal-logo{text-align:center;font-size:42px}.modal-card h2{text-align:center;margin:10px 0}.hint{color:#9eacc8;text-align:center}label{display:block;color:#cbd7ff;margin:11px 0 5px}input{width:100%;box-sizing:border-box;border:1px solid #273452;background:#0c1427;color:#eef3ff;border-radius:8px;padding:10px;font:inherit}button{width:100%;border:0;border-radius:8px;background:#6d8cff;color:#fff;padding:10px 15px;font-weight:700;cursor:pointer;margin-top:22px}.login-error{margin:14px 0;padding:11px 13px;border:1px solid #c45165;border-radius:9px;background:#3b202c;color:#ffc4cc;text-align:center;font-weight:600}</style></head><body><div class="modal-mask"><div class="modal-card"><div class="modal-logo">🔐</div><h2>管理后台登录</h2><p class="hint">请输入本系统后台账号和密码</p>''' + error_html + '''<form method="post" action="/login"><label>后台账号</label><input name="username" required autocomplete="username"><label>后台密码</label><input type="password" name="password" required autocomplete="current-password"><button>登录后台</button></form></div></div></body></html>'''
     return login_html
 
+def webdav_url_for(user=None, server_id=None):
+    sid=server_id if server_id is not None else (user['server_id'] if user and 'server_id' in user.keys() else None)
+    server=get_server(sid)
+    return (server.get('public_url') or server.get('url') or setting('openlist_url')) if server else setting('openlist_url')
+
 def registered_info_page(inv, user):
     username = user['username']
     base = user['base_path'] or '/'
-    configured = setting('openlist_url')
+    configured = webdav_url_for(user=user)
     parsed = urlsplit(configured)
     protocol = (parsed.scheme or 'http').upper()
     address = parsed.hostname or configured
@@ -257,8 +369,8 @@ def registered_info_page(inv, user):
     content = '<div class="card"><div class="success-wrap"><div class="success-icon">✓</div><h2>注册信息查询</h2><p class="success-sub">以下信息与注册成功后展示的配置说明一致</p></div><div class="guide-card"><div class="guide-row"><span>用户名</span><b>'+esc(username)+'</b></div><div class="guide-row guide-plan-row"><span>套餐</span><b><span class="plan-badge '+plan_cls+'">'+esc(plan)+'</span></b></div><div class="guide-row"><span>会员到期时间</span><b>'+esc(expiry)+'</b></div></div><textarea class="config-textarea" readonly>'+esc(template)+'</textarea><p class="notice">出于安全原因，系统不会保存或回显注册时设置的明文密码。密码请使用注册时设置的密码；如遗失，请联系客服处理。</p><div class="success-actions">'+contact_html+'<a class="secondary-link" href="'+back_url+'">返回查询页面</a></div></div>'+contact_modal
     return page(content, '注册信息查询', public=True)
 
-def success_page(username, pwd, base, public=False):
-    configured = setting('openlist_url')
+def success_page(username, pwd, base, public=False, server_id=None):
+    configured = webdav_url_for(server_id=server_id)
     parsed = urlsplit(configured)
     protocol = (parsed.scheme or 'http').upper()
     address = parsed.hostname or configured
@@ -332,7 +444,7 @@ class Handler(BaseHTTPRequestHandler):
             label=PLAN_LABELS.get(inv['plan'],inv['plan'])
             themes={'day':('plan-theme-day','☀','简洁轻盈'),'week':('plan-theme-week','⚡','活力清新'),'month':('plan-theme-month','●','稳定可靠'),'quarter':('plan-theme-quarter','◆','进阶紫韵'),'halfyear':('plan-theme-halfyear','♥','品质粉彩'),'year':('plan-theme-year','★','尊享金色')}
             theme,icon,slogan=themes.get(inv['plan'],('plan-theme-month','●','稳定可靠'))
-            body='''<div class="card register-card '''+theme+'''"><div class="register-plan-icon">'''+icon+'''</div><h2 class="register-title">会员服务兑换</h2><p class="register-slogan">卡密已就绪：'''+esc(code)+'''（'''+esc(label)+'''·'''+str(PLAN_DAYS[inv['plan']])+'''天）</p><div class="redeem-tabs"><button type="button" class="redeem-tab active" id="tab-new" onclick="switchMode(\'new\')">● 我是新用户</button><button type="button" class="redeem-tab" id="tab-old" onclick="switchMode(\'old\')">○ 老用户充值</button></div><form method="post" id="redeem-form" onsubmit="return validateRedeem()"><input type="hidden" name="mode" id="redeem-mode" value="new"><div id="new-user-fields"><label>用户名</label><input name="username" id="register-username" required minlength="1" minlength="4" maxlength="8" pattern="[a-z0-9]{4,8}" placeholder="小写字母或数字，4-8位" autocomplete="off" oninput="checkRegisterUsername()"><span id="register-username-status" class="username-status" aria-live="polite"></span><label>设置密码</label><input name="password" id="new-password" type="password" required autocomplete="new-password"><label>确认密码</label><input name="confirm_password" id="confirm-password" type="password" required autocomplete="new-password"></div><div id="old-user-fields" style="display:none"><label>续费账号</label><input name="old_username" id="old-username" autocomplete="username" disabled><label>账户密码</label><input name="old_password" id="old-password" type="password" autocomplete="current-password" disabled></div><button class="register-submit" id="register-submit">立即开通</button></form></div><style>.redeem-tabs{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:16px 0}.redeem-tab{margin:0;background:#0b1428;border:1px solid var(--line);color:#d9e2ff;border-radius:10px}.redeem-tab.active{background:#213b78;border-color:var(--plan-color)}.username-status{display:block;font-size:12px;color:var(--muted);margin-top:5px}.username-status.available{color:#7ee7b7}.username-status.exists{color:#ff9eaa}</style><script>var registerTimer,registerAvailable=false;function switchMode(mode){var isNew=mode==='new';document.getElementById('redeem-mode').value=mode;document.getElementById('new-user-fields').style.display=isNew?'block':'none';document.getElementById('old-user-fields').style.display=isNew?'none':'block';document.getElementById('tab-new').classList.toggle('active',isNew);document.getElementById('tab-old').classList.toggle('active',!isNew);['register-username','new-password','confirm-password'].forEach(function(id){var x=document.getElementById(id);x.disabled=!isNew;x.required=isNew});['old-username','old-password'].forEach(function(id){var x=document.getElementById(id);x.disabled=isNew;x.required=!isNew});document.getElementById('register-submit').textContent=isNew?'立即开通':'立即延长时长'}function checkRegisterUsername(){clearTimeout(registerTimer);var i=document.getElementById('register-username'),s=document.getElementById('register-username-status'),v=i.value.trim();registerAvailable=false;s.textContent='';if(!v)return;s.textContent='检查中…';registerTimer=setTimeout(function(){fetch('/api/check-username?username='+encodeURIComponent(v)).then(function(r){return r.json()}).then(function(x){if(i.value.trim()!==v)return;registerAvailable=!x.exists&&!x.forbidden&&!x.invalid;s.className='username-status '+(registerAvailable?'available':'exists');s.textContent=x.invalid?'仅支持小写字母和数字，长度4-8位':(x.forbidden?'用户名不可用':(x.exists?'用户名已存在，请更换':'用户名可用'))}).catch(function(){registerAvailable=false;s.textContent='暂时无法检查'})},250)}function showDuplicatePopup(message){var old=document.getElementById('duplicate-popup');if(old)old.remove();var m=document.createElement('div');m.id='duplicate-popup';m.className='duplicate-popup';m.innerHTML='<div class="duplicate-popup-card"><div class="duplicate-popup-icon">!</div><h2>用户名已存在</h2><p></p><button type="button" class="duplicate-popup-button">返回修改用户名</button></div>';m.querySelector('p').textContent=message||'这个用户名已经被注册了，请更换一个新的用户名。';var close=function(){m.classList.remove('show');setTimeout(function(){m.remove()},200);var u=document.getElementById('register-username');if(u){u.focus();u.select()}};m.querySelector('button').onclick=close;m.addEventListener('click',function(e){if(e.target===m)close()});document.body.appendChild(m);requestAnimationFrame(function(){m.classList.add('show')})}function validateRedeem(){if(document.getElementById('redeem-mode').value==='old')return true;var u=document.getElementById('register-username'),p=document.getElementById('new-password'),c=document.getElementById('confirm-password');if(!registerAvailable){showDuplicatePopup('这个用户名已经被注册了，请更换一个新的用户名。');return false}if(p.value!==c.value){showDuplicatePopup('两次输入的密码不一致，请重新确认密码。');c.focus();return false}return true}</script>'''
+            body='''<div class="card register-card '''+theme+'''"><div class="register-plan-icon">'''+icon+'''</div><h2 class="register-title">会员服务兑换</h2><p class="register-slogan">卡密已就绪：'''+esc(code)+'''（'''+esc(label)+'''·'''+str(PLAN_DAYS[inv['plan']])+'''天）</p><div class="redeem-tabs"><button type="button" class="redeem-tab active" id="tab-new" onclick="switchMode(\'new\')">● 我是新用户</button><button type="button" class="redeem-tab" id="tab-old" onclick="switchMode(\'old\')">○ 老用户充值</button></div><form method="post" id="redeem-form" onsubmit="return validateRedeem()"><input type="hidden" name="mode" id="redeem-mode" value="new"><div id="new-user-fields"><label>选择服务器</label><select name="server_id" required>'''+(''.join('<option value="'+str(x['id'])+'" '+('selected' if str(x['id'])==setting('default_server_id','') else '')+('' if x['selectable'] else ' disabled')+'>'+esc(x['name'])+'（'+(('剩余 '+str(max(0,x['quota']-x['count']) if x['quota'] else '不限')) if x['count_status']=='ok' else '配额状态暂不可用')+'）</option>' for x in available_servers()) if available_servers() else '<option value="">暂无已启用服务器</option>')+'''</select><label>用户名</label><input name="username" id="register-username" required minlength="1" minlength="4" maxlength="8" pattern="[a-z0-9]{4,8}" placeholder="小写字母或数字，4-8位" autocomplete="off" oninput="checkRegisterUsername()"><span id="register-username-status" class="username-status" aria-live="polite"></span><label>设置密码</label><input name="password" id="new-password" type="password" required autocomplete="new-password"><label>确认密码</label><input name="confirm_password" id="confirm-password" type="password" required autocomplete="new-password"></div><div id="old-user-fields" style="display:none"><label>续费账号</label><input name="old_username" id="old-username" autocomplete="username" disabled><label>账户密码</label><input name="old_password" id="old-password" type="password" autocomplete="current-password" disabled></div><button class="register-submit" id="register-submit">立即开通</button></form></div><style>.redeem-tabs{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:16px 0}.redeem-tab{margin:0;background:#0b1428;border:1px solid var(--line);color:#d9e2ff;border-radius:10px}.redeem-tab.active{background:#213b78;border-color:var(--plan-color)}.username-status{display:block;font-size:12px;color:var(--muted);margin-top:5px}.username-status.available{color:#7ee7b7}.username-status.exists{color:#ff9eaa}</style><script>var registerTimer,registerAvailable=false;function switchMode(mode){var isNew=mode==='new';document.getElementById('redeem-mode').value=mode;document.getElementById('new-user-fields').style.display=isNew?'block':'none';document.getElementById('old-user-fields').style.display=isNew?'none':'block';document.getElementById('tab-new').classList.toggle('active',isNew);document.getElementById('tab-old').classList.toggle('active',!isNew);['register-username','new-password','confirm-password'].forEach(function(id){var x=document.getElementById(id);x.disabled=!isNew;x.required=isNew});['old-username','old-password'].forEach(function(id){var x=document.getElementById(id);x.disabled=isNew;x.required=!isNew});document.getElementById('register-submit').textContent=isNew?'立即开通':'立即延长时长'}function checkRegisterUsername(){clearTimeout(registerTimer);var i=document.getElementById('register-username'),s=document.getElementById('register-username-status'),v=i.value.trim();registerAvailable=false;s.textContent='';if(!v)return;s.textContent='检查中…';registerTimer=setTimeout(function(){fetch('/api/check-username?username='+encodeURIComponent(v)).then(function(r){return r.json()}).then(function(x){if(i.value.trim()!==v)return;registerAvailable=!x.exists&&!x.forbidden&&!x.invalid;s.className='username-status '+(registerAvailable?'available':'exists');s.textContent=x.invalid?'仅支持小写字母和数字，长度4-8位':(x.forbidden?'用户名不可用':(x.exists?'用户名已存在，请更换':'用户名可用'))}).catch(function(){registerAvailable=false;s.textContent='暂时无法检查'})},250)}function showDuplicatePopup(message){var old=document.getElementById('duplicate-popup');if(old)old.remove();var m=document.createElement('div');m.id='duplicate-popup';m.className='duplicate-popup';m.innerHTML='<div class="duplicate-popup-card"><div class="duplicate-popup-icon">!</div><h2>用户名已存在</h2><p></p><button type="button" class="duplicate-popup-button">返回修改用户名</button></div>';m.querySelector('p').textContent=message||'这个用户名已经被注册了，请更换一个新的用户名。';var close=function(){m.classList.remove('show');setTimeout(function(){m.remove()},200);var u=document.getElementById('register-username');if(u){u.focus();u.select()}};m.querySelector('button').onclick=close;m.addEventListener('click',function(e){if(e.target===m)close()});document.body.appendChild(m);requestAnimationFrame(function(){m.classList.add('show')})}function validateRedeem(){if(document.getElementById('redeem-mode').value==='old')return true;var u=document.getElementById('register-username'),p=document.getElementById('new-password'),c=document.getElementById('confirm-password');if(!registerAvailable){showDuplicatePopup('这个用户名已经被注册了，请更换一个新的用户名。');return false}if(p.value!==c.value){showDuplicatePopup('两次输入的密码不一致，请重新确认密码。');c.focus();return false}return true}</script>'''
             return self.send(200,page(body,'用户注册', public=True))
         if not self.auth():
             if p.path == '/': return self.send(200, login_modal())
@@ -367,7 +479,7 @@ class Handler(BaseHTTPRequestHandler):
             user_total=db().execute('SELECT COUNT(*) FROM users WHERE '+user_where,user_params).fetchone()[0]
             total_pages=max(1,(user_total+page_size-1)//page_size)
             page_no=min(page_no,total_pages)
-            rows=db().execute('SELECT * FROM users WHERE '+user_where+' ORDER BY id DESC LIMIT ? OFFSET ?',(*user_params,page_size,(page_no-1)*page_size)).fetchall()
+            rows=db().execute('SELECT users.*,servers.name AS server_name FROM users LEFT JOIN servers ON servers.id=users.server_id WHERE '+user_where+' ORDER BY users.id DESC LIMIT ? OFFSET ?',(*user_params,page_size,(page_no-1)*page_size)).fetchall()
             all_users=db().execute('SELECT plan,expires_at FROM users').fetchall()
             summary=[('总用户',len(all_users),'total'),('天卡用户',sum(1 for r in all_users if r['plan']=='day'),'day'),('周卡用户',sum(1 for r in all_users if r['plan']=='week'),'week'),('月卡用户',sum(1 for r in all_users if r['plan']=='month'),'month'),('季卡用户',sum(1 for r in all_users if r['plan']=='quarter'),'quarter'),('半年卡用户',sum(1 for r in all_users if r['plan']=='halfyear'),'halfyear'),('年卡用户',sum(1 for r in all_users if r['plan']=='year'),'year'),('过期用户',sum(1 for r in all_users if r['expires_at'] and r['expires_at']<=now()),'expired')]
             summary_html='<div class="user-stats">'+''.join('<a class="user-stat user-stat-'+kind+(' active' if plan_filter==kind else '')+'" href="/?plan='+kind+'"><span class="user-stat-label">'+label+'</span><strong>'+str(value)+'</strong></a>' for label,value,kind in summary)+'</div>'
@@ -379,7 +491,7 @@ class Handler(BaseHTTPRequestHandler):
                 state='已停用' if r['disabled'] else ('已过期' if expired else '正常'); cls='bad' if r['disabled'] or expired else 'ok'; action='enable' if r['disabled'] else 'disable'; text='恢复' if r['disabled'] else '停用'
                 plan={'day':'天卡','week':'周卡','month':'月卡','quarter':'季卡','halfyear':'半年','year':'年卡','custom':'自定义'}.get(r['plan'],r['plan']); plan_cls={'day':'plan-day','week':'plan-week','month':'plan-month','quarter':'plan-quarter','halfyear':'plan-halfyear','year':'plan-year','custom':'plan-custom'}.get(r['plan'],'plan-custom'); expiry=r['expires_at'] or '永久'
                 renew = f'<button type="button" class="renew" onclick="openRenew({r["id"]},\'{esc(r["username"])}\')">续费</button>'
-                out += f'''<div class="row" data-user-id="{r['id']}"><div class="user-main"><div class="user-meta"><div class="user-title-row"><div class="user-name"><b>{esc(r['username'])}</b></div><div class="user-badges"><span class="badge {cls}">{state}</span><span class="plan-badge {plan_cls}">{esc(plan)}</span></div></div><div class="muted user-info">注册日期：{esc(r['created'])}<br>到期日期：{esc(expiry)}</div></div></div><div class="actions">{renew}<form method="post" action="/user/{r['id']}/{action}"{' onsubmit="return openDisable(this)" data-user="'+esc(r['username'])+'"' if not r['disabled'] else ' onsubmit="return submitInlineAction(this)"'}><button class="{'ok' if r['disabled'] else 'pause'}">{text}</button></form><form method="post" action="/user/{r['id']}/delete" onsubmit="return openDelete(this)" data-user="{esc(r['username'])}"><button class="delete-btn">删除</button></form></div></div>'''
+                out += f'''<div class="row" data-user-id="{r['id']}"><div class="user-main"><div class="user-meta"><div class="user-title-row"><div class="user-name"><b>{esc(r['username'])}</b></div><div class="user-badges"><span class="badge {cls}">{state}</span><span class="plan-badge {plan_cls}">{esc(plan)}</span><span class="plan-badge" style="background:#202d49;color:#c3d8ff">{esc(r['server_name'] or '未绑定')}</span></div></div><div class="muted user-info">注册日期：{esc(r['created'])}<br>到期日期：{esc(expiry)}</div></div></div><div class="actions">{renew}<form method="post" action="/user/{r['id']}/{action}"{' onsubmit="return openDisable(this)" data-user="'+esc(r['username'])+'"' if not r['disabled'] else ' onsubmit="return submitInlineAction(this)"'}><button class="{'ok' if r['disabled'] else 'pause'}">{text}</button></form><form method="post" action="/user/{r['id']}/delete" onsubmit="return openDelete(this)" data-user="{esc(r['username'])}"><button class="delete-btn">删除</button></form></div></div>'''
             if user_total>page_size:
                 def page_url(n):
                     parts=(['q='+__import__('urllib.parse').parse.quote(keyword)] if keyword else [])+(['plan='+plan_filter] if plan_filter!='total' else [])+['page='+str(n)]
@@ -397,7 +509,9 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(200,page(out))
         if p.path == '/new':
             default=setting('default_path','/')
-            return self.send(200, page('''<div class="card"><h2>新增用户</h2><p class="hint">新用户固定为普通用户，仅 WebDAV 读取。</p><form method="post" action="/new"><label class="username-label">用户名 <span id="username-status" class="username-status" aria-live="polite"></span></label><div class="username-field"><input name="username" id="username" required autocomplete="off" oninput="checkUsername()"></div><label>OpenList 目录</label><p class="hint">无特殊需求请保持默认 /</p><input name="base_path" value="%s" placeholder="/"><label>初始密码（留空自动生成）</label><input name="password"><label>套餐类型</label><div class="plan-options"><label class="plan-option plan-option-day"><input type="radio" name="plan" value="day" checked><span class="plan-icon">☀</span><span><b>天卡</b><small>有效期 1 天</small></span></label><label class="plan-option plan-option-week"><input type="radio" name="plan" value="week"><span class="plan-icon">⚡</span><span><b>周卡</b><small>有效期 7 天</small></span></label><label class="plan-option plan-option-month"><input type="radio" name="plan" value="month"><span class="plan-icon">●</span><span><b>月卡</b><small>有效期 30 天</small></span></label><label class="plan-option plan-option-quarter"><input type="radio" name="plan" value="quarter"><span class="plan-icon">◆</span><span><b>季卡</b><small>有效期 90 天</small></span></label><label class="plan-option plan-option-halfyear"><input type="radio" name="plan" value="halfyear"><span class="plan-icon">♥</span><span><b>半年</b><small>有效期 180 天</small></span></label><label class="plan-option plan-option-year"><input type="radio" name="plan" value="year"><span class="plan-icon">★</span><span><b>年卡</b><small>有效期 365 天</small></span></label></div><button>创建用户</button></form></div><script>function checkUsername(){clearTimeout(window.usernameTimer);var i=document.getElementById('username'),s=document.getElementById('username-status'),v=i.value.trim();s.className='username-status';s.textContent='';if(!v)return;window.usernameTimer=setTimeout(function(){fetch('/api/check-username?username='+encodeURIComponent(v)).then(function(r){return r.json()}).then(function(x){if(i.value.trim()!==v)return;s.className='username-status '+((x.exists||x.forbidden||x.invalid)?'exists':'available');s.textContent=x.invalid?'仅支持小写英文字母和数字':(x.forbidden?'该用户名包含管理员相关词语，不允许使用':(x.exists?'用户名已存在，请更换':'用户名可用'))}).catch(function(){})},250)}function toggleExpiry(){var x=document.querySelector('input[name=plan]:checked');document.getElementById('expiry').style.display=x&&x.value==='custom'?'block':'none'}toggleExpiry()</script>''' % esc(default), '新增用户'))
+            choices=available_servers()
+            server_options=''.join('<option value="'+str(x['id'])+'" '+('selected' if str(x['id'])==setting('default_server_id','') else '')+('' if x['selectable'] else ' disabled')+'>'+esc(x['name'])+' — '+(str(x['count'])+'/'+str(x['quota'] or '∞') if x['count_status']=='ok' else '配额状态暂不可用')+'</option>' for x in choices)
+            return self.send(200, page('''<div class="card"><h2>新增用户</h2><p class="hint">新用户固定为普通用户，仅 WebDAV 读取。</p><form method="post" action="/new"><label class="username-label">用户名 <span id="username-status" class="username-status" aria-live="polite"></span></label><div class="username-field"><input name="username" id="username" required autocomplete="off" oninput="checkUsername()"></div><label>选择服务器</label><select name="server_id" required>'''+server_options+'''</select><label>OpenList 目录</label><p class="hint">无特殊需求请保持默认 /</p><input name="base_path" value="%s" placeholder="/"><label>初始密码（留空自动生成）</label><input name="password"><label>套餐类型</label><div class="plan-options"><label class="plan-option plan-option-day"><input type="radio" name="plan" value="day" checked><span class="plan-icon">☀</span><span><b>天卡</b><small>有效期 1 天</small></span></label><label class="plan-option plan-option-week"><input type="radio" name="plan" value="week"><span class="plan-icon">⚡</span><span><b>周卡</b><small>有效期 7 天</small></span></label><label class="plan-option plan-option-month"><input type="radio" name="plan" value="month"><span class="plan-icon">●</span><span><b>月卡</b><small>有效期 30 天</small></span></label><label class="plan-option plan-option-quarter"><input type="radio" name="plan" value="quarter"><span class="plan-icon">◆</span><span><b>季卡</b><small>有效期 90 天</small></span></label><label class="plan-option plan-option-halfyear"><input type="radio" name="plan" value="halfyear"><span class="plan-icon">♥</span><span><b>半年</b><small>有效期 180 天</small></span></label><label class="plan-option plan-option-year"><input type="radio" name="plan" value="year"><span class="plan-icon">★</span><span><b>年卡</b><small>有效期 365 天</small></span></label></div><button>创建用户</button></form></div><script>function checkUsername(){clearTimeout(window.usernameTimer);var i=document.getElementById('username'),s=document.getElementById('username-status'),v=i.value.trim();s.className='username-status';s.textContent='';if(!v)return;window.usernameTimer=setTimeout(function(){fetch('/api/check-username?username='+encodeURIComponent(v)).then(function(r){return r.json()}).then(function(x){if(i.value.trim()!==v)return;s.className='username-status '+((x.exists||x.forbidden||x.invalid)?'exists':'available');s.textContent=x.invalid?'仅支持小写英文字母和数字':(x.forbidden?'该用户名包含管理员相关词语，不允许使用':(x.exists?'用户名已存在，请更换':'用户名可用'))}).catch(function(){})},250)}function toggleExpiry(){var x=document.querySelector('input[name=plan]:checked');document.getElementById('expiry').style.display=x&&x.value==='custom'?'block':'none'}toggleExpiry()</script>''' % esc(default), '新增用户'))
         if p.path == '/invites':
             q=q or {}
             keyword=q.get('q',[''])[0].strip()
@@ -450,11 +564,17 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(200,page(body,'邀请注册'))
         if p.path == '/settings':
             msg='<p class="hint">后台登录账号密码与 OpenList 账号密码分开。OpenList 信息只在这里配置。</p>'
-            body='<div class="card"><h2>系统设置</h2>'+msg+'<form method="post" action="/settings">'
-            body+='<label>OpenList 地址</label><input name="openlist_url" value="'+esc(setting('openlist_url'))+'" required>'
-            body+='<label>OpenList 管理员账号</label><input name="openlist_user" value="'+esc(setting('openlist_user'))+'" required>'
-            body+='<label>OpenList 管理员密码</label><input type="password" name="openlist_pass" value="***" autocomplete="new-password" required><p class="hint">密码已隐藏；如不修改请保持 *** 不变。</p>'
-            body+='<label>新增用户默认目录</label><input name="default_path" value="'+esc(setting('default_path','/'))+'" required>'
+            body='<div class="card"><h2>系统设置</h2>'+msg
+            body+='<h3>OpenList 服务器</h3><p class="hint">配额按 OpenList 实时账号总数计算（包括手动创建账号）；0 表示不限额。</p>'
+            servers=list_servers(); body+='<form method="post" action="/servers/default"><label>默认服务器</label><select name="default_server_id" required>'
+            for srv in servers: body+='<option value="'+str(srv['id'])+'" '+('selected' if str(srv['id'])==setting('default_server_id','') else '')+'>'+esc(srv['name'])+'</option>'
+            body+='</select><button>保存默认服务器</button></form>'
+            for srv in servers:
+                try: cnt=server_count(srv); stat=f"实时账号 {cnt} / 配额 {srv['quota'] or '不限'}，剩余 {max(0,srv['quota']-cnt) if srv['quota'] else '不限'}"
+                except Exception: cnt=-1; stat='实时账号查询失败'
+                body+='<form method="post" action="/servers/save"><fieldset style="margin:16px 0;padding:14px;border:1px solid #2a3b62;border-radius:12px"><legend>'+esc(srv['name'])+' — '+esc(stat)+'</legend><input type="hidden" name="id" value="'+str(srv['id'])+'"><label>备注名称</label><input name="name" value="'+esc(srv['name'])+'"><label>管理地址（API）</label><input name="url" value="'+esc(srv['url'])+'"><label>WebDAV 对外地址</label><input name="public_url" value="'+esc(srv['public_url'])+'"><label>管理员账号</label><input name="username" value="'+esc(srv['username'])+'"><label>管理员密码（留空不修改）</label><input type="password" name="password" value="" placeholder="••••••••"><label>用户配额（0=不限）</label><input type="number" min="0" name="quota" value="'+str(srv['quota'])+'"></fieldset><button>保存服务器设置</button></form>'
+            body+='<h3>添加服务器</h3><form method="post" action="/servers/add"><label>备注名称</label><input name="name" required><label>管理地址（API）</label><input name="url" required><label>WebDAV 对外地址</label><input name="public_url" required><label>管理员账号</label><input name="username" required><label>管理员密码</label><input type="password" name="password" required><label>用户配额（0=不限）</label><input type="number" min="0" name="quota" value="0"><button>添加服务器</button></form>'
+            body+='<form method="post" action="/settings"><label>新增用户默认目录</label><input name="default_path" value="'+esc(setting('default_path','/'))+'" required>'
             body+='<label>客服链接（可选）</label><input name="contact_url" value="'+esc(setting('contact_url'))+'" placeholder="https://..."><p class="hint">已使用邀请链接中的“联系客服”按钮将打开此地址。</p>'
             body+='<label>后台登录账号</label><input name="local_user" value="'+esc(setting('local_user'))+'" required>'
             body+='<label>修改后台密码（留空不修改）</label><input type="password" name="local_pass" value="" autocomplete="new-password">'
@@ -472,8 +592,8 @@ class Handler(BaseHTTPRequestHandler):
         if path.startswith('/register/'):
             with REGISTER_LOCK:
                 return self._do_POST()
-        with DB_LOCK:
-            return self._do_POST()
+        # SQLite writes are committed per route; don't hold this lock over OpenList HTTP calls.
+        return self._do_POST()
 
     def _do_POST(self):
         p=urlparse(self.path); d=self.body(); c=db(); host=self.headers.get('Host','').split(':',1)[0].lower()
@@ -502,7 +622,8 @@ class Handler(BaseHTTPRequestHandler):
                 if not username or not passwd: raise RuntimeError('请输入用户名和密码')
                 user=c.execute('SELECT * FROM users WHERE username=?',(username,)).fetchone()
                 if not user: raise RuntimeError('用户名或密码错误')
-                base_url=setting('openlist_url').rstrip('/')
+                srv=get_server(user['server_id'])
+                base_url=(srv['url'] if srv else setting('openlist_url')).rstrip('/')
                 req=urllib.request.Request(base_url+'/api/auth/login',data=json.dumps({'username':username,'password':passwd}).encode(),method='POST',headers={'Content-Type':'application/json'})
                 try:
                     with urllib.request.urlopen(req,timeout=15) as resp: result=json.loads(resp.read().decode('utf-8','replace'))
@@ -542,13 +663,27 @@ class Handler(BaseHTTPRequestHandler):
                     c.execute('INSERT INTO invites(code,plan,uses,max_uses,created) VALUES(?,?,?,?,?)',(code,plan,0,1,now()))
                 c.commit()
                 return self.send(303,'',headers={'Location':'/invites'})
+            if p.path == '/servers/default':
+                sid=int(d.get('default_server_id','0'));
+                if not c.execute('SELECT 1 FROM servers WHERE id=? AND enabled=1',(sid,)).fetchone(): raise RuntimeError('默认服务器不存在')
+                save_setting('default_server_id',str(sid)); c.commit(); return self.send(303,'',headers={'Location':'/settings'})
+            if p.path in ('/servers/add','/servers/save'):
+                if p.path.endswith('/add'):
+                    c.execute('INSERT INTO servers(name,url,username,password,quota,public_url) VALUES(?,?,?,?,?,?)',(d.get('name','').strip(),d.get('url','').rstrip('/'),d.get('username','').strip(),d.get('password',''),max(0,int(d.get('quota','0') or 0)),d.get('public_url','').rstrip('/')))
+                    new_id=c.execute('SELECT last_insert_rowid()').fetchone()[0]
+                    if not setting('default_server_id'): save_setting('default_server_id',str(new_id))
+                else:
+                    sid=int(d.get('id','0')); old=c.execute('SELECT * FROM servers WHERE id=?',(sid,)).fetchone()
+                    if not old: raise RuntimeError('服务器不存在')
+                    new_url=d.get('url',old['url']).rstrip('/'); new_user=d.get('username',old['username']).strip(); new_pass=d.get('password') or old['password']
+                    token='' if (new_url!=old['url'] or new_user!=old['username'] or new_pass!=old['password']) else old['token']
+                    c.execute('UPDATE servers SET name=?,url=?,username=?,password=?,quota=?,public_url=?,token=? WHERE id=?',(d.get('name',old['name']).strip(),new_url,new_user,new_pass,max(0,int(d.get('quota',old['quota']) or 0)),d.get('public_url',old['public_url']).rstrip('/'),token,sid))
+                c.commit(); return self.send(303,'',headers={'Location':'/settings'})
             if p.path == '/settings':
-                for k in ('openlist_url','openlist_user','default_path','contact_url'): save_setting(k,d.get(k,''))
-                if d.get('openlist_pass','') and d.get('openlist_pass') != '***': save_setting('openlist_pass',d.get('openlist_pass'))
+                for k in ('default_path','contact_url'): save_setting(k,d.get(k,''))
                 password_changed = bool(d.get('local_pass'))
                 if d.get('local_user'): save_setting('local_user', d.get('local_user'))
                 if password_changed: save_setting('local_pass_hash', local_hash(d.get('local_pass')))
-                save_setting('openlist_token', '')
                 if password_changed:
                     SESSIONS.clear()
                     return self.send(303,'',headers={'Location':'/login','Set-Cookie':'openlist_session=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax'})
@@ -573,16 +708,23 @@ class Handler(BaseHTTPRequestHandler):
                     if not local: raise RuntimeError('账户不存在，请重新注册')
                 if not days: raise RuntimeError('卡密套餐无效')
                 if mode=='old':
-                    username=d.get('old_username','').strip(); pwd=d.get('old_password','')
-                    if not username or not pwd: raise RuntimeError('请输入原账号和账户密码')
+                    username=d.get('old_username','').strip(); supplied_pwd=d.get('old_password','')
+                    if not username: raise RuntimeError('请输入续费账号')
+                    # Returning users use the locally encrypted credential; legacy users prove it once.
                     if not local or local['username'] != username: raise RuntimeError('账户不存在，请重新注册')
+                    pwd=decrypt_user_password(local['password_enc']) if local.get('password_enc') else supplied_pwd
+                    if not pwd: raise RuntimeError('首次续费需要输入原账号密码')
                     # Check by username first. If found, preserve existing credentials
                     # and only authenticate the supplied current password. If deleted,
                     # recreate with the submitted password (local system does not store it).
-                    openlist_user=find_openlist_user(username)
-                    base_url=setting('openlist_url').rstrip('/')
+                    sid=local.get('server_id')
+                    srv=get_server(sid)
+                    if not srv: raise RuntimeError('原注册服务器不可用')
+                    openlist_user=find_openlist_user(username,sid)
+                    base_url=srv['url'].rstrip('/')
                     if not base_url: raise RuntimeError('系统尚未配置 OpenList 地址')
                     if openlist_user:
+                        # Verify the legacy password once, then verify/use the encrypted local copy on later renewals.
                         verify_req=urllib.request.Request(base_url+'/api/auth/login',data=json.dumps({'username':username,'password':pwd}).encode(),method='POST',headers={'Content-Type':'application/json'})
                         try:
                             with urllib.request.urlopen(verify_req,timeout=15) as verify_resp:
@@ -592,12 +734,16 @@ class Handler(BaseHTTPRequestHandler):
                             raise RuntimeError('账号或密码错误')
                         if verify_result.get('code') not in (None,0,200): raise RuntimeError('账号或密码错误')
                     else:
+                        # Deleted/expired remote account: recreate on original server if capacity allows, otherwise default server.
+                        count=server_count(srv)
+                        if srv.get('quota') and count>=srv['quota']:
+                            raise RuntimeError('原注册服务器配额已满，暂时无法恢复该账号；请联系管理员处理')
                         # Account absent remotely: the password entered by the user
                         # becomes the password of the recreated OpenList account.
-                        created=api('POST','/api/admin/user/create',{'username':username,'password':pwd,'base_path':local['base_path'],'role':0,'permission':256,'disabled':False})
+                        created=api('POST','/api/admin/user/create',{'username':username,'password':pwd,'base_path':local['base_path'],'role':0,'permission':256,'disabled':False},server_id=sid)
                         user_id=result_user_id(created)
                         if user_id is None:
-                            openlist_user=find_openlist_user(username)
+                            openlist_user=find_openlist_user(username,sid)
                             if not openlist_user or openlist_user.get('id') is None:
                                 raise RuntimeError('OpenList 用户已创建，但无法获取用户 ID，请稍后联系管理员')
                             user_id=openlist_user['id']
@@ -609,21 +755,24 @@ class Handler(BaseHTTPRequestHandler):
                     if local['disabled'] or expired(local['expires_at']) or (local['openlist_id'] and str(local['openlist_id']) != str(openlist_user.get('id'))):
                         user_id=openlist_user.get('id')
                         if not user_id: raise RuntimeError('账户不存在，请重新注册')
-                        api('POST','/api/admin/user/update',{'id':user_id,'username':local['username'],'base_path':local['base_path'],'role':0,'permission':256,'disabled':False})
-                        # Reacquire lock only for the atomic local commit. The invite
+                        api('POST','/api/admin/user/update',{'id':user_id,'username':local['username'],'base_path':local['base_path'],'role':0,'permission':256,'disabled':False},server_id=sid)
+                    elif local['openlist_id']:
+                        # Active accounts retain their ID; no password-changing update is needed.
+                        user_id=local['openlist_id']
+                    # Reacquire lock only for the atomic local commit. The invite
                     # lock held by do_POST prevents duplicate redemption in-process.
                     with DB_LOCK:
                         c.execute('BEGIN IMMEDIATE')
                         current_inv=c.execute('SELECT uses,max_uses FROM invites WHERE id=?',(inv_id,)).fetchone()
                         if not current_inv or current_inv['uses']>=current_inv['max_uses']:
                             c.rollback(); raise RuntimeError('卡密已被使用')
-                        c.execute('UPDATE users SET openlist_id=?,disabled=0,plan=?,expires_at=?,updated=? WHERE id=?',(user_id,display_plan,expiry,now(),local['id']))
+                        c.execute('UPDATE users SET openlist_id=?,server_id=?,disabled=0,plan=?,expires_at=?,updated=?,password_enc=? WHERE id=?',(user_id,sid,display_plan,expiry,now(),encrypt_user_password(pwd),local['id']))
                         c.execute('UPDATE invites SET uses=uses+1,used_at=?,registered_username=? WHERE id=? AND uses<max_uses',(now(),username,inv_id))
                         if c.execute('SELECT changes()').fetchone()[0]!=1:
                             c.rollback(); raise RuntimeError('卡密已被使用')
                         c.commit()
                     success_body='''<div class="renew-complete"><div class="renew-complete-glow"></div><div class="renew-complete-card"><div class="renew-complete-icon"><svg viewBox="0 0 64 64" aria-hidden="true"><circle cx="32" cy="32" r="28" fill="none" stroke="currentColor" stroke-width="3" opacity=".25"/><path d="m18 33 9 9 19-21" fill="none" stroke="currentColor" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/></svg></div><span class="renew-complete-kicker">MEMBERSHIP RENEWED</span><h2>充值成功</h2><p class="renew-complete-lead">会员时长已成功延长，祝您使用愉快</p><div class="renew-complete-details"><div><span>续费账号</span><strong>'''+esc(username)+'''</strong></div><div><span>本次充值</span><strong>'''+str(days)+''' 天</strong></div><div class="renew-complete-expiry"><span>新的到期时间</span><strong>'''+esc(expiry)+'''</strong></div></div><div class="renew-complete-foot"><span class="renew-complete-dot"></span>账号状态已恢复，可继续使用</div></div></div><style>.renew-complete{position:relative;min-height:calc(100vh - 110px);display:grid;place-items:center;padding:30px 16px;overflow:hidden}.renew-complete-glow{position:absolute;width:360px;height:360px;border-radius:50%;background:radial-gradient(circle,#24c98a22,transparent 68%);filter:blur(8px);pointer-events:none}.renew-complete-card{position:relative;width:min(100%,480px);padding:38px 32px 30px;border:1px solid #2c795e;border-radius:24px;background:linear-gradient(150deg,#142d33 0%,#101d30 48%,#111a2d 100%);box-shadow:0 28px 80px #0007,0 0 50px #1cbd7720;text-align:center;animation:renewRise .55s cubic-bezier(.2,.8,.2,1) both}.renew-complete-icon{display:grid;place-items:center;width:82px;height:82px;margin:0 auto 20px;border:1px solid #65e5ad;border-radius:26px;background:linear-gradient(145deg,#35c98a,#15845f);color:#effff7;box-shadow:0 12px 30px #159a7255,0 0 0 8px #35c98a12;transform:rotate(-4deg)}.renew-complete-icon svg{width:52px;height:52px}.renew-complete-kicker{color:#79ddb2;font-size:10px;font-weight:800;letter-spacing:2.5px}.renew-complete-card h2{margin:8px 0 7px;color:#f3fff9;font-size:30px;letter-spacing:1px}.renew-complete-lead{margin:0;color:#a9c9bc;font-size:14px;line-height:1.8}.renew-complete-details{margin:28px 0 18px;padding:4px 18px;border:1px solid #294a49;border-radius:16px;background:#09192366;text-align:left}.renew-complete-details>div{display:flex;justify-content:space-between;align-items:center;gap:16px;padding:15px 2px;border-bottom:1px solid #29414a}.renew-complete-details>div:last-child{border:0}.renew-complete-details span{color:#91a9ac;font-size:13px}.renew-complete-details strong{color:#edf7f5;font-size:15px;text-align:right;overflow-wrap:anywhere}.renew-complete-expiry strong{color:#78e0b0}.renew-complete-foot{display:flex;justify-content:center;align-items:center;gap:8px;color:#85b6a2;font-size:12px}.renew-complete-dot{width:7px;height:7px;border-radius:50%;background:#44d393;box-shadow:0 0 12px #44d393}.@keyframes renewRise{from{opacity:0;transform:translateY(12px) scale(.985)}to{opacity:1;transform:translateY(0) scale(1)}}@media(max-width:520px){.renew-complete{min-height:calc(100vh - 70px);padding:20px 4px}.renew-complete-card{padding:30px 20px 24px;border-radius:20px}.renew-complete-icon{width:72px;height:72px;border-radius:22px}.renew-complete-card h2{font-size:27px}.renew-complete-details{padding:2px 13px}.renew-complete-details>div{padding:14px 0}}</style>'''
-                    return self.send(200,page(success_body,'充值成功',public=True))
+                    return self.send(200,page(success_body+ '<div class="card"><h3>WebDAV 配置信息</h3><pre>'+esc('服务器：'+srv['name']+'\n地址：'+(srv.get('public_url') or srv['url'])+'\n账号：'+username+'\n密码：使用本次填写的密码\n路径：/dav')+'</pre></div>','充值成功',public=True))
                 if mode!='new': raise RuntimeError('兑换方式无效')
                 # New-user flow also runs without DB_LOCK during OpenList I/O;
                 # duplicate names are checked again atomically before local commit.
@@ -635,32 +784,28 @@ class Handler(BaseHTTPRequestHandler):
                 if forbidden_username(username): raise RuntimeError('该用户名包含管理员相关词语，不允许使用')
                 if c.execute('SELECT 1 FROM users WHERE username=?',(username,)).fetchone(): raise RuntimeError('用户名已存在，请更换')
                 if not base.startswith('/'): base='/'+base
+                sid=int(d.get('server_id') or 0); srv=get_server(sid)
+                if not srv or not srv.get('id'): raise RuntimeError('请选择有效服务器')
+                if not username: raise RuntimeError('用户名不能为空')
+                if invalid_username(username): raise RuntimeError('用户名仅支持小写英文字母和数字，长度最多 8 位')
+                if forbidden_username(username): raise RuntimeError('该用户名包含管理员相关词语，不允许使用')
+                if c.execute('SELECT 1 FROM users WHERE username=?',(username,)).fetchone(): raise RuntimeError('用户名已存在，请更换')
+                if srv.get('quota'):
+                    try: count=server_count(srv)
+                    except Exception: raise RuntimeError('所选服务器当前无法查询配额，请稍后重试')
+                    if count>=srv['quota']: raise RuntimeError('所选服务器配额已满，请选择其他服务器')
                 try:
-                    result=api('POST','/api/admin/user/create',{'username':username,'password':pwd,'base_path':base,'role':0,'permission':256,'disabled':False})
+                    result=api('POST','/api/admin/user/create',{'username':username,'password':pwd,'base_path':base,'role':0,'permission':256,'disabled':False},server_id=sid)
                     oid=result_user_id(result)
                     if oid is None:
-                        found=find_openlist_user(username)
+                        found=find_openlist_user(username,sid)
                         if not found or found.get('id') is None: raise RuntimeError('OpenList 用户创建成功，但未能获取用户 ID')
                         oid=found['id']
                 except RuntimeError as create_error:
-                    # 上一次请求可能已在 OpenList 创建成功，但本地 SQLite 落库/响应中断，
-                    # 重试时会收到 UNIQUE constraint。只有能用本次密码登录该账号时才自动接管，
-                    # 避免误关联他人已有账号。
-                    if 'UNIQUE constraint failed' not in str(create_error) and '已存在' not in str(create_error):
-                        raise
-                    base_url=setting('openlist_url').rstrip('/')
-                    verify_req=urllib.request.Request(base_url+'/api/auth/login',data=json.dumps({'username':username,'password':pwd}).encode(),method='POST',headers={'Content-Type':'application/json'})
-                    try:
-                        with urllib.request.urlopen(verify_req,timeout=15) as verify_resp:
-                            verify_result=json.loads(verify_resp.read().decode('utf-8','replace'))
-                        if verify_result.get('code') not in (None,0,200) or not (verify_result.get('data',{}).get('token') or verify_result.get('token')):
-                            raise RuntimeError('用户名已存在，请使用原注册密码重试，或更换用户名')
-                    except (urllib.error.HTTPError,urllib.error.URLError,ValueError):
-                        raise RuntimeError('用户名已存在，请使用原注册密码重试，或更换用户名')
-                    found=find_openlist_user(username)
-                    if not found or found.get('id') is None:
-                        raise RuntimeError('OpenList 中已存在该用户，但无法同步用户信息')
-                    oid=found['id']
+                    # The local registry is the sole username authority. Never adopt a remote-only account.
+                    if 'UNIQUE constraint failed' in str(create_error) or '已存在' in str(create_error):
+                        raise RuntimeError('OpenList 返回用户名冲突，但管理系统中没有该用户记录；为避免关联错误账号，已停止注册，请联系管理员核对数据')
+                    raise
                 t=now()
                 with DB_LOCK:
                     c.execute('BEGIN IMMEDIATE')
@@ -669,14 +814,15 @@ class Handler(BaseHTTPRequestHandler):
                         c.rollback(); raise RuntimeError('卡密已被使用')
                     if c.execute('SELECT 1 FROM users WHERE username=?',(username,)).fetchone():
                         c.rollback(); raise RuntimeError('用户名已存在，请更换')
-                    c.execute('INSERT INTO users(openlist_id,username,base_path,disabled,plan,expires_at,created,updated) VALUES(?,?,?,?,?,?,?,?)',(oid,username,base,0,plan,expiry,t,t))
+                    c.execute('INSERT INTO users(openlist_id,username,base_path,disabled,plan,expires_at,created,updated,server_id,password_enc) VALUES(?,?,?,?,?,?,?,?,?,?)',(oid,username,base,0,plan,expiry,t,t,sid,encrypt_user_password(pwd)))
                     c.execute('UPDATE invites SET uses=uses+1,used_at=?,registered_username=? WHERE id=? AND uses<max_uses',(now(),username,inv_id))
                     if c.execute('SELECT changes()').fetchone()[0]!=1:
                         c.rollback(); raise RuntimeError('卡密已被使用')
                     c.commit()
-                return self.send(200,success_page(username,pwd,base,public=True))
+                return self.send(200,success_page(username,pwd,base,public=True,server_id=sid))
             if p.path == '/new':
-                username=d.get('username',''); base=d.get('base_path','/') or '/'; pwd=d.get('password','') or password(); plan=d.get('plan','week'); expiry=d.get('expires_at','').strip()
+                password_cipher()  # Fail before creating a remote account if encryption isn't configured.
+                username=d.get('username',''); server_id=int(d.get('server_id') or 0); srv=get_server(server_id); base=d.get('base_path','/') or '/'; pwd=d.get('password','') or password(); plan=d.get('plan','week'); expiry=d.get('expires_at','').strip()
                 if plan == 'day': expiry=(datetime.now()+timedelta(days=1)).strftime('%Y-%m-%d %H:%M:%S')
                 elif plan == 'halfyear': expiry=(datetime.now()+timedelta(days=180)).strftime('%Y-%m-%d %H:%M:%S')
                 elif plan == 'week': expiry=(datetime.now()+timedelta(days=7)).strftime('%Y-%m-%d %H:%M:%S')
@@ -684,21 +830,27 @@ class Handler(BaseHTTPRequestHandler):
                 elif plan == 'quarter': expiry=(datetime.now()+timedelta(days=90)).strftime('%Y-%m-%d %H:%M:%S')
                 elif plan == 'year': expiry=(datetime.now()+timedelta(days=365)).strftime('%Y-%m-%d %H:%M:%S')
                 else: raise RuntimeError('套餐类型无效')
+                if not srv or not srv.get('id'): raise RuntimeError('请选择有效服务器')
+                if srv.get('quota'):
+                    try: count=server_count(srv)
+                    except Exception: raise RuntimeError('所选服务器当前无法查询配额，请稍后重试')
+                    if count>=srv['quota']: raise RuntimeError('所选服务器配额已满，请选择其他服务器')
                 if not username: raise RuntimeError('用户名不能为空')
                 if invalid_username(username): raise RuntimeError('用户名仅支持小写英文字母和数字，长度最多 8 位')
                 if forbidden_username(username): raise RuntimeError('该用户名包含管理员相关词语，不允许使用')
                 if c.execute('SELECT 1 FROM users WHERE username=?',(username,)).fetchone():
                     raise RuntimeError('用户名已存在，请更换')
                 if not base.startswith('/'): base='/'+base
-                result=api('POST','/api/admin/user/create',{'username':username,'password':pwd,'base_path':base,'role':0,'permission':256,'disabled':False})
+                c.commit()  # release SQLite read transaction before contacting remote OpenList
+                result=api('POST','/api/admin/user/create',{'username':username,'password':pwd,'base_path':base,'role':0,'permission':256,'disabled':False},server_id=server_id)
                 data=result.get('data') or result.get('user') or result
                 oid=result_user_id(result)
                 if oid is None:
-                    found=find_openlist_user(username)
+                    found=find_openlist_user(username,server_id)
                     if not found or found.get('id') is None: raise RuntimeError('OpenList 用户创建成功，但未能获取用户 ID')
                     oid=found['id']
-                t=now(); c.execute('INSERT INTO users(openlist_id,username,base_path,disabled,plan,expires_at,created,updated) VALUES(?,?,?,?,?,?,?,?)',(oid,username,base,0,plan,expiry,t,t)); c.commit()
-                return self.send(200, success_page(username, pwd, base))
+                t=now(); c.execute('INSERT INTO users(openlist_id,username,base_path,disabled,plan,expires_at,created,updated,server_id,password_enc) VALUES(?,?,?,?,?,?,?,?,?,?)',(oid,username,base,0,plan,expiry,t,t,server_id,encrypt_user_password(pwd))); c.commit()
+                return self.send(200, success_page(username, pwd, base,server_id=server_id))
             parts=p.path.strip('/').split('/')
             if len(parts)==3 and parts[0]=='user' and parts[2] in ('disable','enable'):
                 r=c.execute('SELECT * FROM users WHERE id=?',(int(parts[1]),)).fetchone()
@@ -706,12 +858,12 @@ class Handler(BaseHTTPRequestHandler):
                 disabled=parts[2]=='disable'
                 oid=r['openlist_id']
                 if not oid:
-                    found=find_openlist_user(r['username'])
+                    found=find_openlist_user(r['username'],r['server_id'])
                     if not found: raise RuntimeError(f'OpenList 中找不到用户：{r["username"]}')
                     oid=found['id']
                     c.execute('UPDATE users SET openlist_id=?,updated=? WHERE id=?',(oid,now(),r['id']))
                 payload={'id':oid,'username':r['username'],'base_path':r['base_path'],'role':0,'permission':256,'disabled':disabled}
-                api('POST','/api/admin/user/update',payload)
+                api('POST','/api/admin/user/update',payload,server_id=r['server_id'])
                 c.execute('UPDATE users SET disabled=?,updated=? WHERE id=?',(int(disabled),now(),r['id'])); c.commit()
                 return self.done()
             if len(parts)==3 and parts[0]=='user' and parts[2]=='renew':
@@ -726,7 +878,27 @@ class Handler(BaseHTTPRequestHandler):
                 # 达到更高档位时升级显示为该档位；不会因单次续费较小而降级。
                 total_days=max(1, int((datetime.strptime(expiry, '%Y-%m-%d %H:%M:%S')-datetime.strptime(r['created'], '%Y-%m-%d %H:%M:%S')).total_seconds() / 86400))
                 display_plan=plan_for_duration_days(total_days)
-                c.execute('UPDATE users SET plan=?,expires_at=?,updated=? WHERE id=?',(display_plan,expiry,now(),r['id'])); c.commit()
+                # If expired cleanup removed the remote account, restore it before extending; never leave a renewed record detached.
+                if not r['openlist_id']:
+                    sid=r['server_id']; srv=get_server(sid)
+                    if not srv: raise RuntimeError('原服务器不可用，无法续费恢复账户')
+                    count=server_count(srv)
+                    if srv.get('quota') and count>=srv['quota']:
+                        target=get_server()
+                        if not target or target['id']==srv['id'] or (target.get('quota') and server_count(target)>=target['quota']):
+                            raise RuntimeError('原服务器配额已满且默认服务器不可用或已满')
+                        sid=target['id']; srv=target
+                    generated=decrypt_user_password(r['password_enc']) if r.get('password_enc') else password()
+                    made=api('POST','/api/admin/user/create',{'username':r['username'],'password':generated,'base_path':r['base_path'],'role':0,'permission':256,'disabled':False},server_id=sid)
+                    oid=result_user_id(made)
+                    if oid is None:
+                        found=find_openlist_user(r['username'],sid)
+                        if not found: raise RuntimeError('账户创建成功，但无法获取账号 ID')
+                        oid=found['id']
+                    c.execute('UPDATE users SET server_id=?,openlist_id=?,disabled=0,plan=?,expires_at=?,updated=?,password_enc=COALESCE(password_enc,?) WHERE id=?',(sid,oid,display_plan,expiry,now(),encrypt_user_password(generated),r['id']))
+                else:
+                    c.execute('UPDATE users SET disabled=0,plan=?,expires_at=?,updated=? WHERE id=?',(display_plan,expiry,now(),r['id']))
+                c.commit()
                 return self.done()
             if len(parts)==3 and parts[0]=='user' and parts[2]=='plan':
                 r=c.execute('SELECT * FROM users WHERE id=?',(int(parts[1]),)).fetchone()
@@ -742,11 +914,11 @@ class Handler(BaseHTTPRequestHandler):
                 if not r: raise RuntimeError('本地用户不存在')
                 oid=r['openlist_id']
                 if not oid:
-                    found=find_openlist_user(r['username'])
+                    found=find_openlist_user(r['username'],r['server_id'])
                     if not found: raise RuntimeError('OpenList 中找不到该用户，已停止删除')
                     oid=found['id']
                     c.execute('UPDATE users SET openlist_id=?,updated=? WHERE id=?',(oid,now(),r['id']))
-                api('POST',f'/api/admin/user/delete?id={oid}')
+                api('POST',f'/api/admin/user/delete?id={oid}',server_id=r['server_id'])
                 c.execute('DELETE FROM users WHERE id=?',(r['id'],)); c.commit()
                 return self.send(303,'',headers={'Location':'/'})
             raise RuntimeError('未知操作')
